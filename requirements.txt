@@ -1,0 +1,45 @@
+# ============================================================
+# SecureEdge AI — Python Dependencies
+# Target: Python 3.10 / 3.11 | Windows + Linux | Android-compatible
+# ============================================================
+
+# ── Core numerical / vision ────────────────────────────────
+numpy>=1.24.0,<2.0.0         # Array operations; <2.0 for TFLite compat
+opencv-python>=4.8.0          # Camera, image I/O, CLAHE, cascade fallback
+                              # Use opencv-python-headless on Android/CI (no GUI)
+
+# ── TensorFlow / TFLite ───────────────────────────────────
+# Option A: Full TensorFlow (training + inference, ~500 MB)
+tensorflow>=2.13.0,<2.16.0
+
+# Option B: TFLite-only runtime (inference only, ~30 MB) — uncomment for prod
+# tflite-runtime>=2.13.0      # pip install tflite-runtime
+
+# ── MediaPipe (Face Mesh, additional landmarks) ───────────
+mediapipe>=0.10.3             # Face Mesh for EAR blink detection
+
+# ── Scientific / utilities ────────────────────────────────
+scipy>=1.11.0                 # Optional: spatial KD-tree for large gallery search
+
+# ── ONNX export (conversion pipeline) ────────────────────
+onnx>=1.14.0
+tf2onnx>=1.15.0               # TF → ONNX conversion
+onnxruntime>=1.16.0           # ONNX inference validation
+
+# ── Database (encrypted embedding storage) ────────────────
+# SQLCipher Python binding — install separately if needed:
+# pip install pysqlcipher3     (Linux/macOS)
+# pip install sqlcipher3       (Windows pre-built wheels)
+# Standard SQLite (no encryption) — always available:
+# import sqlite3               # stdlib, no pip install needed
+
+# ── Visualisation / evaluation ────────────────────────────
+matplotlib>=3.7.0             # Confusion matrix, ROC curves
+Pillow>=10.0.0                # Image loading in evaluation scripts
+
+# ── Development / testing ─────────────────────────────────
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# ── Optional: GPU acceleration (uncomment if CUDA available) ─
+# tensorflow-gpu>=2.13.0,<2.16.0   # Replace tensorflow above
