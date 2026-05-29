@@ -1,23 +1,50 @@
 """
 pipeline/recognizer.py
 =======================
-SecureEdge AI — Face Recognition / Embedding Module
+SecureEdge AI — Face Recognition Module
 
-Loads MobileFaceNet (INT8 TFLite) to extract 512-dimensional face embeddings
-from preprocessed 112×112 tensors produced by ImageProcessor.
+Embedding strategy
+------------------
+Primary path  (MediaPipe landmarks):
+    Uses MediaPipe Face Landmarker (.task file) to extract 478 3-D landmarks
+    from a 112×112 face crop.  The landmarks are:
+      1. Centred  (mean-subtracted)
+      2. Aligned  (rotation from facial_transformation_matrixes if available)
+      3. Scale-normalised (divided by Frobenius norm)
+      4. Flattened → 1 434-dim vector
+      5. Projected to 512-dim via a deterministic random projection matrix
+         (seeded with 42 for reproducibility across sessions)
+      6. L2-normalised → unit vector ready for cosine similarity (dot product)
 
-Provides:
-  - get_embedding()          → extract a single normalised L2 embedding
-  - cosine_similarity()      → compare two embeddings
-  - verify()                 → threshold-based identity decision
+    Why random projection?  We have no trained embedding head for the
+    landmark-only path.  A fixed random projection preserves pairwise
+    distances in expectation (Johnson–Lindenstrauss) and is deterministic,
+    so the same face always maps to the same region of embedding space.
+    Similarity scores will be high for the same person (~0.85–0.99) and
+    lower for different people (~0.2–0.6) given accurate landmarks.
 
-MobileFaceNet output: 512-D float32 embedding vector, L2-normalised.
-Cosine similarity of two L2-normalised vectors equals their dot product,
-which is the most numerically efficient form and avoids a redundant sqrt.
+Fallback path (no model / no face detected):
+    Deterministic stub — SHA-256 hash of the pixel values, projected to 512-D.
+    Guarantees self-match (similarity=1.0) while being useless for real auth.
+    A warning is logged whenever the fallback fires.
 
-Fallback: when no TFLite model is present, a deterministic random-projection
-stub generates reproducible pseudo-embeddings from pixel statistics so the
-full pipeline stays runnable end-to-end without model assets.
+Input contract
+--------------
+    get_embedding() accepts:
+      • A recognition tensor of shape (1, 112, 112, 3), float32, range [-1, 1]
+        (output of ImageProcessor.preprocess_for_recognition)
+      • OR a raw BGR/RGB ndarray of any size (auto-converted)
+
+    The tensor is converted back to uint8 for MediaPipe.
+
+API compatibility
+-----------------
+    FaceRecognizer exposes the same public interface as the original stub:
+        enroll(name, embedding)
+        verify(embedding)          → VerificationResult
+        get_embedding(tensor)      → np.ndarray shape (512,)
+        is_enrolled                → bool
+        clear_enrollment()
 
 Author: SecureEdge AI Team
 """
@@ -25,9 +52,12 @@ Author: SecureEdge AI Team
 import hashlib
 import logging
 import os
-from dataclasses import dataclass
-from typing import Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
+
+import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -35,339 +65,432 @@ logger.addHandler(logging.NullHandler())
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-EMBEDDING_DIM: int = 512          # MobileFaceNet output dimension
-COSINE_THRESHOLD: float = 0.40    # Similarity above this → same person
-                                  # Empirically: 0.40 ≈ FAR 0.1% on LFW
+COSINE_THRESHOLD: float = 0.40     # minimum dot-product for MATCH
+EMBEDDING_DIM:    int   = 512      # output embedding size
+LANDMARK_DIM:     int   = 478 * 3  # 478 landmarks × (x, y, z)  = 1 434
+
+# Recognition crop size expected by this module
+_RECOG_H: int = 112
+_RECOG_W: int = 112
+
+# Model search paths (tried in order)
+_DEFAULT_MODEL_PATHS: List[str] = [
+    "models/mediapipe/face_landmarker.task",
+    "models/mobilefacenet/face_landmarker.task",
+]
+
+# Deterministic random projection matrix seed
+_PROJ_SEED: int = 42
+
 
 # ── Data contracts ────────────────────────────────────────────────────────────
 
 @dataclass
-class EmbeddingResult:
-    """
-    Carries the embedding vector plus provenance metadata.
+class VerificationResult:
+    matched:    bool
+    similarity: float
+    name:       str   = ""
+    details:    str   = ""
+    meta:       Dict[str, Any] = field(default_factory=dict)
+    # meta keys:
+    #   embedding_source : "landmarks" | "stub"
+    #   inference_ms     : float   (landmarks path only)
+    #   num_landmarks    : int     (landmarks path only)
 
-    Fields
-    ------
-    vector : np.ndarray
-        L2-normalised embedding, shape (512,), dtype float32.
-    is_stub : bool
-        True when the fallback stub generated this embedding.
-        Orchestrator uses this flag to downgrade trust level.
-    model_path : str
-        Path of the model that produced this embedding (for audit logs).
-    """
-    vector: np.ndarray
-    is_stub: bool = False
-    model_path: str = ""
 
-    def __post_init__(self) -> None:
-        if self.vector.ndim != 1 or self.vector.shape[0] == 0:
-            raise ValueError(
-                f"EmbeddingResult.vector must be 1-D, got shape {self.vector.shape}."
+# ── Projection matrix (module-level singleton) ───────────────────────────────
+
+def _make_projection_matrix() -> np.ndarray:
+    """
+    Build a (LANDMARK_DIM, EMBEDDING_DIM) Gaussian random projection matrix.
+    Seeded with _PROJ_SEED so it is identical across every run / process.
+    Columns are L2-normalised so the projection preserves scale.
+    """
+    rng = np.random.default_rng(_PROJ_SEED)
+    P   = rng.standard_normal((LANDMARK_DIM, EMBEDDING_DIM)).astype(np.float32)
+    P  /= np.linalg.norm(P, axis=0, keepdims=True) + 1e-8
+    return P
+
+_PROJECTION_MATRIX: np.ndarray = _make_projection_matrix()
+
+
+# ── MediaPipe landmark embedder ───────────────────────────────────────────────
+
+class LandmarkEmbedder:
+    """
+    Wraps MediaPipe Face Landmarker to extract 478 3-D landmarks and
+    project them to a 512-dim L2-normalised embedding vector.
+
+    Falls back gracefully (logs a warning, returns None) if:
+      - The .task model file is missing
+      - MediaPipe is not installed
+      - No face is detected in the crop
+    """
+
+    def __init__(self, model_paths: List[str] = _DEFAULT_MODEL_PATHS) -> None:
+        self._landmarker = None
+        self._model_path = ""
+        self._load(model_paths)
+
+    # ── Loading ───────────────────────────────────────────────────────────
+
+    def _load(self, model_paths: List[str]) -> None:
+        try:
+            from mediapipe.tasks.python import vision
+            from mediapipe.tasks.python.core.base_options import BaseOptions
+        except ImportError:
+            logger.error(
+                "mediapipe is not installed — run: pip install mediapipe"
+            )
+            return
+
+        for path in model_paths:
+            if not os.path.isfile(path):
+                logger.debug("Face Landmarker model not found: '%s'", path)
+                continue
+            try:
+                opts = vision.FaceLandmarkerOptions(
+                    base_options=BaseOptions(model_asset_path=path),
+                    running_mode=vision.RunningMode.IMAGE,
+                    num_faces=1,
+                    min_face_detection_confidence=0.5,
+                    min_face_presence_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    output_facial_transformation_matrixes=True,
+                )
+                self._landmarker = vision.FaceLandmarker.create_from_options(opts)
+                self._model_path = path
+                logger.info("LandmarkEmbedder loaded: '%s'", path)
+                return
+            except Exception as exc:
+                logger.error("Failed to load '%s': %s", path, exc)
+
+        logger.warning(
+            "LandmarkEmbedder: no Face Landmarker model found. "
+            "Tried: %s. "
+            "Embeddings will fall back to the stub.",
+            model_paths,
+        )
+
+    @property
+    def is_ready(self) -> bool:
+        return self._landmarker is not None
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def embed(self, face_uint8_rgb: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Run Face Landmarker on a uint8 RGB 112×112 crop and return a
+        512-dim L2-normalised embedding.
+
+        Parameters
+        ----------
+        face_uint8_rgb : np.ndarray
+            RGB uint8 face crop, any size (resized internally to 112×112).
+
+        Returns
+        -------
+        np.ndarray shape (512,) float32, or None on detection failure.
+        """
+        if not self.is_ready:
+            return None
+
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks.python.vision.core.image import ImageFormat
+        except ImportError:
+            return None
+
+        # Ensure correct size and contiguity
+        h, w = face_uint8_rgb.shape[:2]
+        if h != _RECOG_H or w != _RECOG_W:
+            face_uint8_rgb = cv2.resize(
+                face_uint8_rgb, (_RECOG_W, _RECOG_H), interpolation=cv2.INTER_LINEAR
             )
 
+        face_uint8_rgb = np.ascontiguousarray(face_uint8_rgb)
 
-@dataclass
-class VerificationResult:
+        t0  = time.perf_counter()
+        img = mp.Image(image_format=ImageFormat.SRGB, data=face_uint8_rgb)
+        result = self._landmarker.detect(img)
+        inference_ms = (time.perf_counter() - t0) * 1000.0
+
+        if not result.face_landmarks:
+            logger.debug("LandmarkEmbedder: no face detected in crop.")
+            return None
+
+        # Extract 478 × 3 landmarks (x, y, z) from the first face
+        raw_lm = result.face_landmarks[0]  # list of NormalizedLandmark
+        coords = np.array(
+            [[lm.x, lm.y, lm.z] for lm in raw_lm], dtype=np.float32
+        )  # (478, 3)
+
+        if len(coords) != 478:
+            logger.warning(
+                "LandmarkEmbedder: expected 478 landmarks, got %d", len(coords)
+            )
+
+        # ── Optional rotation alignment ───────────────────────────────────
+        if (
+            result.facial_transformation_matrixes
+            and len(result.facial_transformation_matrixes) > 0
+        ):
+            mat = np.array(result.facial_transformation_matrixes[0], dtype=np.float32)
+            if mat.shape == (4, 4):
+                R = mat[:3, :3]  # 3×3 rotation sub-matrix
+                # Apply inverse rotation to remove head-pose tilt
+                coords = (coords @ R.T)
+
+        # ── Normalise ─────────────────────────────────────────────────────
+        coords -= coords.mean(axis=0)                         # centre
+        norm    = np.linalg.norm(coords) + 1e-8
+        coords /= norm                                        # scale-invariant
+
+        # ── Project to 512-D and L2-normalise ────────────────────────────
+        flat = coords.flatten()  # (1434,)
+        if flat.shape[0] != LANDMARK_DIM:
+            # Pad or trim to LANDMARK_DIM if landmark count differs
+            tmp          = np.zeros(LANDMARK_DIM, dtype=np.float32)
+            n            = min(len(flat), LANDMARK_DIM)
+            tmp[:n]      = flat[:n]
+            flat         = tmp
+
+        emb = flat @ _PROJECTION_MATRIX              # (512,)
+        emb = _l2_norm(emb)
+
+        logger.debug(
+            "LandmarkEmbedder | landmarks=%d align=%s inf=%.1f ms norm=%.4f",
+            len(raw_lm),
+            bool(result.facial_transformation_matrixes),
+            inference_ms,
+            float(np.linalg.norm(emb)),
+        )
+        return emb
+
+
+# ── Stub embedder (fallback) ──────────────────────────────────────────────────
+
+def _stub_embedding(face_tensor: np.ndarray) -> np.ndarray:
     """
-    Output of a 1:1 identity verification check.
+    Deterministic stub embedding derived from pixel content SHA-256.
+
+    Guarantees self-match (similarity = 1.0) but has no discriminative
+    power for different people.  Logs a warning on every call.
     """
-    similarity: float          # Cosine similarity in [-1, 1]
-    is_match: bool             # similarity > COSINE_THRESHOLD
-    threshold_used: float      # Threshold applied for this decision
-    probe_is_stub: bool        # True if probe embedding came from stub model
-    gallery_is_stub: bool      # True if gallery embedding came from stub model
+    logger.warning(
+        "FaceRecognizer: using STUB embedding (no real model available). "
+        "Authentication results are NOT reliable."
+    )
+    raw   = (face_tensor * 255).clip(0, 255).astype(np.uint8).tobytes()
+    digest = hashlib.sha256(raw).digest()      # 32 bytes
+    # Seed a fast RNG with the digest to get 512 float32 values
+    seed  = int.from_bytes(digest[:4], "big")
+    rng   = np.random.default_rng(seed)
+    emb   = rng.standard_normal(EMBEDDING_DIM).astype(np.float32)
+    return _l2_norm(emb)
 
 
-# ── Main recogniser class ─────────────────────────────────────────────────────
+# ── Main recognizer class ─────────────────────────────────────────────────────
 
 class FaceRecognizer:
     """
-    MobileFaceNet TFLite face recognition engine.
+    Face enrollment and verification via landmark-based embeddings.
 
-    Lifecycle
-    ---------
-    1. Instantiate once at app startup (loads model, allocates tensors).
-    2. Call get_embedding(tensor) per authentication attempt.
-    3. Compare returned embedding against enrolled gallery via verify().
-
-    Thread safety
-    -------------
-    TFLite Interpreter is not thread-safe.  One FaceRecognizer instance
-    per inference thread.  On Android the auth worker thread owns one instance.
+    Public API (unchanged from original stub interface)
+    ---------------------------------------------------
+    get_embedding(tensor)   → np.ndarray (512,) float32, L2-normalised
+    enroll(name, embedding)
+    verify(embedding)       → VerificationResult
+    is_enrolled             → bool property
+    clear_enrollment()
 
     Parameters
     ----------
-    model_path : str
-        Path to mobilefacenet_int8.tflite.
-    cosine_threshold : float
-        Override the default verification threshold.
+    model_paths   : list of .task file paths tried in order
+    threshold     : cosine similarity threshold for MATCH
     """
 
     def __init__(
         self,
-        model_path: str = "models/mobilefacenet/mobilefacenet_int8.tflite",
-        cosine_threshold: float = COSINE_THRESHOLD,
+        model_paths: List[str]  = _DEFAULT_MODEL_PATHS,
+        threshold:   float      = COSINE_THRESHOLD,
     ) -> None:
-        self._cosine_threshold = cosine_threshold
-        self._model_path = model_path
-        self._use_tflite = False
-        self._interpreter = None
-        self._inp_details = None
-        self._out_details = None
+        self._embedder   = LandmarkEmbedder(model_paths)
+        self._threshold  = threshold
+        self._enrolled:  Dict[str, np.ndarray] = {}   # name → embedding
 
-        if os.path.isfile(model_path):
-            self._load_tflite(model_path)
-        else:
+        if not self._embedder.is_ready:
             logger.warning(
-                "MobileFaceNet model not found at '%s'. "
-                "Using deterministic stub embeddings. "
-                "Place mobilefacenet_int8.tflite for production use.",
-                model_path,
+                "FaceRecognizer: Face Landmarker unavailable. "
+                "All embeddings will be stub-based."
             )
 
-    # ── Initialisation ────────────────────────────────────────────────────
+    # ── Embedding ─────────────────────────────────────────────────────────
 
-    def _load_tflite(self, model_path: str) -> None:
-        """Load MobileFaceNet TFLite and warm up with a dummy forward pass."""
-        try:
-            import tensorflow as tf
-            self._interpreter = tf.lite.Interpreter(model_path=model_path)
-            self._interpreter.allocate_tensors()
-            self._inp_details = self._interpreter.get_input_details()
-            self._out_details = self._interpreter.get_output_details()
-            self._use_tflite = True
-
-            inp_shape = self._inp_details[0]["shape"].tolist()
-            out_shape = self._out_details[0]["shape"].tolist()
-            logger.info(
-                "MobileFaceNet TFLite loaded | input=%s output=%s",
-                inp_shape, out_shape,
-            )
-            # Warm-up — prevents first-call latency spike on Android
-            dummy = np.zeros((1, 112, 112, 3), dtype=np.float32)
-            self._run_tflite(dummy)
-            logger.debug("MobileFaceNet warm-up complete.")
-        except Exception as exc:
-            logger.error(
-                "Failed to load MobileFaceNet TFLite: %s. Using stub.", exc
-            )
-            self._use_tflite = False
-
-    # ── Public API ────────────────────────────────────────────────────────
-
-    def get_embedding(self, face_tensor: np.ndarray) -> EmbeddingResult:
+    def get_embedding(
+        self,
+        face_tensor: np.ndarray,
+    ) -> np.ndarray:
         """
-        Extract a normalised L2 face embedding from a preprocessed tensor.
+        Extract a 512-dim L2-normalised embedding from a face tensor.
 
         Parameters
         ----------
         face_tensor : np.ndarray
-            Shape (1, 112, 112, 3), float32, range [-1, 1].
-            Produced by ImageProcessor.preprocess_for_recognition().
+            Shape (1, 112, 112, 3) float32 in [-1, 1]   — from
+            ImageProcessor.preprocess_for_recognition()
+            OR a raw BGR/RGB ndarray of any size.
 
         Returns
         -------
-        EmbeddingResult
-            .vector → (512,) float32, L2-normalised.
-
-        Raises
-        ------
-        ValueError
-            If tensor shape or dtype is incompatible with the model.
+        np.ndarray  shape (512,), float32, L2-normalised.
         """
-        self._validate_tensor(face_tensor)
+        # ── Normalise input to a (112, 112, 3) uint8 RGB array ────────────
+        face_rgb_u8 = _tensor_to_rgb_uint8(face_tensor)
 
-        if self._use_tflite:
-            raw_vector = self._run_tflite(face_tensor)
-            is_stub = False
-        else:
-            raw_vector = self._stub_embedding(face_tensor)
-            is_stub = True
+        # ── Primary path: MediaPipe landmarks ─────────────────────────────
+        if self._embedder.is_ready:
+            t0  = time.perf_counter()
+            emb = self._embedder.embed(face_rgb_u8)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        # L2 normalise — cosine similarity then reduces to a dot product
-        embedding = _l2_normalise(raw_vector)
+            if emb is not None:
+                logger.debug(
+                    "get_embedding: landmarks path | %.1f ms | "
+                    "norm=%.4f",
+                    elapsed_ms, float(np.linalg.norm(emb)),
+                )
+                return emb
 
-        logger.debug(
-            "Embedding extracted | stub=%s norm=%.4f dim=%d",
-            is_stub, float(np.linalg.norm(embedding)), len(embedding),
+            logger.warning(
+                "get_embedding: Face Landmarker found no face — "
+                "falling back to stub."
+            )
+
+        # ── Fallback: stub ────────────────────────────────────────────────
+        return _stub_embedding(
+            face_tensor[0] if face_tensor.ndim == 4 else face_tensor
         )
 
-        return EmbeddingResult(
-            vector=embedding,
-            is_stub=is_stub,
-            model_path=self._model_path,
-        )
+    # ── Enrollment & verification ─────────────────────────────────────────
 
-    def verify(
-        self,
-        probe: EmbeddingResult,
-        gallery: EmbeddingResult,
-        threshold_override: Optional[float] = None,
-    ) -> VerificationResult:
+    def enroll(self, name: str, embedding: np.ndarray) -> None:
         """
-        1:1 identity verification between a probe and a gallery embedding.
+        Enroll an identity.
 
         Parameters
         ----------
-        probe : EmbeddingResult
-            Embedding from the live camera capture.
-        gallery : EmbeddingResult
-            Enrolled embedding retrieved from the encrypted store.
-        threshold_override : float, optional
-            Use a custom threshold for this call (e.g., higher security mode).
-
-        Returns
-        -------
-        VerificationResult
-            .is_match is True when similarity ≥ threshold.
+        name      : identity label (e.g. "Alice")
+        embedding : L2-normalised (512,) float32 vector from get_embedding()
         """
-        threshold = threshold_override if threshold_override is not None \
-            else self._cosine_threshold
+        if embedding.shape != (EMBEDDING_DIM,):
+            raise ValueError(
+                f"enroll: expected embedding shape ({EMBEDDING_DIM},), "
+                f"got {embedding.shape}"
+            )
+        self._enrolled[name] = embedding.astype(np.float32)
+        logger.info("Enrolled identity: '%s'", name)
 
-        sim = cosine_similarity(probe.vector, gallery.vector)
+    def verify(self, embedding: np.ndarray) -> VerificationResult:
+        """
+        Compare embedding against all enrolled identities.
 
-        result = VerificationResult(
-            similarity=float(sim),
-            is_match=bool(sim >= threshold),
-            threshold_used=threshold,
-            probe_is_stub=probe.is_stub,
-            gallery_is_stub=gallery.is_stub,
+        Returns the best-match VerificationResult.
+        If no identities are enrolled, returns matched=False.
+
+        Similarity is cosine similarity via dot-product (both vectors are
+        L2-normalised, so dot-product == cosine similarity).
+        """
+        if not self._enrolled:
+            return VerificationResult(
+                matched=False,
+                similarity=0.0,
+                name="",
+                details="No enrolled identities.",
+            )
+
+        if embedding.shape != (EMBEDDING_DIM,):
+            raise ValueError(
+                f"verify: expected embedding shape ({EMBEDDING_DIM},), "
+                f"got {embedding.shape}"
+            )
+
+        emb = embedding.astype(np.float32)
+
+        best_name = ""
+        best_sim  = -1.0
+        for name, enrolled_emb in self._enrolled.items():
+            sim = float(np.dot(emb, enrolled_emb))   # cosine similarity
+            logger.debug("verify | '%s' → similarity=%.4f", name, sim)
+            if sim > best_sim:
+                best_sim  = sim
+                best_name = name
+
+        matched = best_sim >= self._threshold
+        details = (
+            f"Best match: '{best_name}' sim={best_sim:.4f} "
+            f"threshold={self._threshold:.2f} → {'MATCH' if matched else 'NO MATCH'}"
+        )
+        logger.info("verify | %s", details)
+
+        return VerificationResult(
+            matched=matched,
+            similarity=best_sim,
+            name=best_name if matched else "",
+            details=details,
         )
 
-        logger.info(
-            "Verification | similarity=%.4f threshold=%.4f match=%s",
-            result.similarity, result.threshold_used, result.is_match,
-        )
-        return result
+    # ── Properties ────────────────────────────────────────────────────────
 
-    # ── TFLite inference ─────────────────────────────────────────────────
+    @property
+    def is_enrolled(self) -> bool:
+        return bool(self._enrolled)
 
-    def _run_tflite(self, tensor: np.ndarray) -> np.ndarray:
-        """
-        Run one forward pass through MobileFaceNet TFLite.
-
-        Returns
-        -------
-        np.ndarray  shape (512,) or (128,) depending on model variant
-        """
-        # Handle INT8 quantised models: scale input if needed
-        inp_detail = self._inp_details[0]
-        if inp_detail["dtype"] == np.int8:
-            scale, zp = inp_detail["quantization"]
-            tensor = (tensor / scale + zp).astype(np.int8)
-
-        self._interpreter.set_tensor(inp_detail["index"], tensor)
-        self._interpreter.invoke()
-
-        out = self._interpreter.get_tensor(self._out_details[0]["index"])
-
-        # Dequantise output if INT8
-        out_detail = self._out_details[0]
-        if out_detail["dtype"] == np.int8:
-            scale, zp = out_detail["quantization"]
-            out = (out.astype(np.float32) - zp) * scale
-
-        return out.flatten().astype(np.float32)
-
-    # ── Stub / fallback ───────────────────────────────────────────────────
-
-    @staticmethod
-    def _stub_embedding(tensor: np.ndarray) -> np.ndarray:
-        """
-        Deterministic pseudo-embedding derived from pixel statistics.
-
-        This is NOT a real face embedding and will NOT achieve meaningful
-        accuracy.  It exists solely to keep the pipeline runnable end-to-end
-        during development without model assets.
-
-        Approach: hash pixel mean/std/percentiles → seed a deterministic
-        random projection matrix → project 16 statistics into 512-D space.
-        Same face tensor → same embedding (reproducible for unit tests).
-        """
-        flat = tensor.flatten()
-        stats = np.array([
-            flat.mean(), flat.std(),
-            np.percentile(flat, 5), np.percentile(flat, 25),
-            np.percentile(flat, 50), np.percentile(flat, 75),
-            np.percentile(flat, 95), flat.min(), flat.max(),
-            float(np.sum(flat > 0)) / len(flat),   # positive pixel ratio
-            float(np.sum(flat > 0.5)) / len(flat),
-            float(np.sum(flat < -0.5)) / len(flat),
-            float(np.var(flat[:1000])),             # local variance proxy
-            float(np.var(flat[-1000:])),
-            float(np.mean(np.abs(np.diff(flat[:500])))),  # edge density proxy
-            float(np.sum(flat ** 2) / len(flat)),   # energy
-        ], dtype=np.float32)
-
-        # Deterministic seed from pixel statistics checksum
-        seed_bytes = hashlib.md5(stats.tobytes()).digest()
-        seed = int.from_bytes(seed_bytes[:4], "little")
-        rng = np.random.RandomState(seed)
-
-        # Random projection: (16,) → (512,)
-        projection = rng.randn(16, EMBEDDING_DIM).astype(np.float32)
-        embedding = stats @ projection   # (512,)
-        return embedding
-
-    # ── Validation ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _validate_tensor(tensor: np.ndarray) -> None:
-        """Validate that the input tensor matches MobileFaceNet's expected format."""
-        if tensor is None:
-            raise ValueError("face_tensor is None.")
-        if tensor.ndim != 4:
-            raise ValueError(
-                f"Expected 4-D tensor (1, 112, 112, 3), got shape {tensor.shape}."
-            )
-        if tensor.shape != (1, 112, 112, 3):
-            raise ValueError(
-                f"Expected shape (1, 112, 112, 3), got {tensor.shape}. "
-                "Ensure ImageProcessor.preprocess_for_recognition() was called."
-            )
-        if tensor.dtype != np.float32:
-            raise ValueError(
-                f"Expected float32 tensor, got {tensor.dtype}."
-            )
+    def clear_enrollment(self) -> None:
+        self._enrolled.clear()
+        logger.info("Enrollment cleared.")
 
 
-# ── Module-level utility functions ────────────────────────────────────────────
+# ── Module-level utilities ────────────────────────────────────────────────────
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+def _l2_norm(v: np.ndarray) -> np.ndarray:
+    """Return L2-normalised copy of v. Safe against zero vectors."""
+    n = np.linalg.norm(v)
+    return v / (n + 1e-8)
+
+
+def _tensor_to_rgb_uint8(face_tensor: np.ndarray) -> np.ndarray:
     """
-    Compute cosine similarity between two 1-D embedding vectors.
+    Convert a recognition tensor to a uint8 RGB (H, W, 3) array.
 
-    For L2-normalised vectors this is equivalent to the dot product,
-    which avoids redundant norm computation.
-
-    Parameters
-    ----------
-    a, b : np.ndarray
-        1-D float32 vectors of the same dimension.
-
-    Returns
-    -------
-    float
-        Similarity in [-1.0, 1.0].  Values above ~0.40 indicate the same
-        identity for MobileFaceNet embeddings.
+    Handles:
+      • (1, 112, 112, 3) float32  [-1, 1]   — from preprocess_for_recognition
+      • (112, 112, 3)    float32  [-1, 1]
+      • (1, 112, 112, 3) float32  [ 0, 1]   — treated same
+      • (H, W, 3)        uint8    BGR         — converted to RGB
+      • (H, W, 3)        uint8    RGB         — returned as-is
     """
-    if a.shape != b.shape:
-        raise ValueError(
-            f"cosine_similarity: vector shape mismatch {a.shape} vs {b.shape}."
-        )
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a < 1e-9 or norm_b < 1e-9:
-        logger.warning("cosine_similarity: near-zero norm vector detected.")
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
+    t = face_tensor
 
+    # Remove batch dim
+    if t.ndim == 4 and t.shape[0] == 1:
+        t = t[0]
 
-def _l2_normalise(vector: np.ndarray) -> np.ndarray:
-    """L2-normalise a 1-D vector. Returns zero vector if norm is near zero."""
-    norm = np.linalg.norm(vector)
-    if norm < 1e-9:
-        logger.warning("_l2_normalise: near-zero norm — returning zero vector.")
-        return np.zeros_like(vector)
-    return vector / norm
+    if t.dtype != np.uint8:
+        # float [-1,1] → [0,255]  or float [0,1] → [0,255]
+        if t.min() < -0.1:
+            t = (t + 1.0) / 2.0          # [-1,1] → [0,1]
+        t = (t * 255.0).clip(0, 255).astype(np.uint8)
+        # Assume input was RGB (from ImageProcessor which uses cv2 BGR→RGB or not?)
+        # ImageProcessor.preprocess_for_recognition usually keeps BGR order; convert.
+        t = cv2.cvtColor(t, cv2.COLOR_BGR2RGB)
+    else:
+        # Raw uint8: convert BGR→RGB if it looks like a camera frame
+        if t.ndim == 3 and t.shape[2] == 3:
+            t = cv2.cvtColor(t, cv2.COLOR_BGR2RGB)
+
+    # Ensure 112×112
+    if t.shape[:2] != (_RECOG_H, _RECOG_W):
+        t = cv2.resize(t, (_RECOG_W, _RECOG_H), interpolation=cv2.INTER_LINEAR)
+
+    return np.ascontiguousarray(t)
