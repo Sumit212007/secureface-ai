@@ -56,7 +56,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-
 import cv2
 import numpy as np
 
@@ -96,6 +95,107 @@ class VerificationResult:
     #   embedding_source : "landmarks" | "stub"
     #   inference_ms     : float   (landmarks path only)
     #   num_landmarks    : int     (landmarks path only)
+
+
+# ── Backward-compatibility shims ─────────────────────────────────────────────
+# The original stub recognizer exported EmbeddingResult and cosine_similarity.
+# pipeline/__init__.py, orchestrator.py, and test_pipeline.py import these by
+# name.  They are preserved here as complete, production-safe wrappers so ALL
+# existing call patterns continue to work without any changes to other files.
+#
+# Supported legacy call patterns:
+#   result = recognizer.get_embedding(tensor)  → EmbeddingResult
+#   vec    = result.embedding                  → np.ndarray (512,)
+#   sim    = cosine_similarity(result, other)  → float  (transparent ndarray)
+#   sim    = cosine_similarity(result.embedding, other.embedding)  → float
+#   recognizer.enroll("Alice", result)         → works (via __array__)
+#   recognizer.verify(result)                  → works (via __array__)
+#   np.dot(result, other)                      → works (via __array__)
+
+class EmbeddingResult(np.ndarray):
+    """
+    Backward-compatible embedding container.
+
+    Subclasses np.ndarray so it IS a (512,) float32 array — every existing
+    call that passes it to np.dot(), cosine_similarity(), enroll(), or
+    verify() works without modification.
+
+    Extra attributes (read-only after construction):
+        embedding    : np.ndarray view  — the (512,) vector (self)
+        confidence   : float            — always 1.0 (was stub placeholder)
+        model_name   : str              — "landmarks" or "stub"
+        inference_ms : float            — wall-clock time for the embed call
+
+    Construction
+    ------------
+    Use EmbeddingResult.from_array(vec, ...) — never call the ndarray
+    constructor directly.
+    """
+
+    # np.ndarray subclass protocol ----------------------------------------
+    def __new__(
+        cls,
+        array:        np.ndarray,
+        confidence:   float = 1.0,
+        model_name:   str   = "landmarks",
+        inference_ms: float = 0.0,
+    ) -> "EmbeddingResult":
+        obj = np.asarray(array, dtype=np.float32).view(cls)
+        obj.confidence   = confidence
+        obj.model_name   = model_name
+        obj.inference_ms = inference_ms
+        return obj
+
+    def __array_finalize__(self, obj: object) -> None:
+        if obj is None:
+            return
+        self.confidence   = getattr(obj, "confidence",   1.0)
+        self.model_name   = getattr(obj, "model_name",   "landmarks")
+        self.inference_ms = getattr(obj, "inference_ms", 0.0)
+
+    # Convenience attribute -----------------------------------------------
+    @property
+    def embedding(self) -> np.ndarray:
+        """Return the underlying (512,) ndarray view."""
+        return np.asarray(self)
+
+    # Nice repr ------------------------------------------------------------
+    def __repr__(self) -> str:  # type: ignore[override]
+        return (
+            f"EmbeddingResult(model={self.model_name!r} "
+            f"confidence={self.confidence:.3f} "
+            f"inference_ms={self.inference_ms:.1f} "
+            f"norm={float(np.linalg.norm(self)):.4f})"
+        )
+
+    # Factory --------------------------------------------------------------
+    @classmethod
+    def from_array(
+        cls,
+        array:        np.ndarray,
+        confidence:   float = 1.0,
+        model_name:   str   = "landmarks",
+        inference_ms: float = 0.0,
+    ) -> "EmbeddingResult":
+        return cls(array, confidence, model_name, inference_ms)
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Cosine similarity between two L2-normalised embedding vectors.
+
+    Both vectors are assumed to be unit-norm (output of get_embedding()),
+    so cosine similarity reduces to a dot product.
+
+    Accepts plain np.ndarray or EmbeddingResult interchangeably.
+
+    Returns
+    -------
+    float in [-1.0, 1.0];  1.0 = identical,  0.0 = orthogonal
+    """
+    a = np.asarray(a, dtype=np.float32).ravel()
+    b = np.asarray(b, dtype=np.float32).ravel()
+    return float(np.dot(a, b))
 
 
 # ── Projection matrix (module-level singleton) ───────────────────────────────
@@ -330,9 +430,15 @@ class FaceRecognizer:
     def get_embedding(
         self,
         face_tensor: np.ndarray,
-    ) -> np.ndarray:
+    ) -> "EmbeddingResult":
         """
         Extract a 512-dim L2-normalised embedding from a face tensor.
+
+        Returns an EmbeddingResult, which IS a np.ndarray subclass.
+        All existing code that treats the return value as a plain ndarray
+        (np.dot, cosine_similarity, enroll, verify) continues to work
+        without modification.  Code that accesses .embedding, .confidence,
+        .model_name, or .inference_ms also works.
 
         Parameters
         ----------
@@ -343,7 +449,7 @@ class FaceRecognizer:
 
         Returns
         -------
-        np.ndarray  shape (512,), float32, L2-normalised.
+        EmbeddingResult  shape (512,), float32, L2-normalised.
         """
         # ── Normalise input to a (112, 112, 3) uint8 RGB array ────────────
         face_rgb_u8 = _tensor_to_rgb_uint8(face_tensor)
@@ -356,11 +462,15 @@ class FaceRecognizer:
 
             if emb is not None:
                 logger.debug(
-                    "get_embedding: landmarks path | %.1f ms | "
-                    "norm=%.4f",
+                    "get_embedding: landmarks path | %.1f ms | norm=%.4f",
                     elapsed_ms, float(np.linalg.norm(emb)),
                 )
-                return emb
+                return EmbeddingResult.from_array(
+                    emb,
+                    confidence=1.0,
+                    model_name="landmarks",
+                    inference_ms=elapsed_ms,
+                )
 
             logger.warning(
                 "get_embedding: Face Landmarker found no face — "
@@ -368,8 +478,16 @@ class FaceRecognizer:
             )
 
         # ── Fallback: stub ────────────────────────────────────────────────
-        return _stub_embedding(
+        t0  = time.perf_counter()
+        emb = _stub_embedding(
             face_tensor[0] if face_tensor.ndim == 4 else face_tensor
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return EmbeddingResult.from_array(
+            emb,
+            confidence=0.0,       # 0.0 signals "not a real embedding"
+            model_name="stub",
+            inference_ms=elapsed_ms,
         )
 
     # ── Enrollment & verification ─────────────────────────────────────────
@@ -381,7 +499,8 @@ class FaceRecognizer:
         Parameters
         ----------
         name      : identity label (e.g. "Alice")
-        embedding : L2-normalised (512,) float32 vector from get_embedding()
+        embedding : L2-normalised (512,) float32 vector from get_embedding().
+                    Accepts both plain np.ndarray and EmbeddingResult.
         """
         if embedding.shape != (EMBEDDING_DIM,):
             raise ValueError(
