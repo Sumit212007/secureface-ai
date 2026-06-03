@@ -108,15 +108,18 @@ class AuthPipeline:
     def __init__(
         self,
         detector_model: str = "models/blazeface/face_detection_short_range.tflite",
-        recognizer_model: str = "models/mobilefacenet/mobilefacenet_int8.tflite",
+        recognizer_model: str = "models/mobilefacenet/mobilefacenet.onnx",
         antispoofing_model: str = "models/antispoofing/antispoofing_int8.tflite",
-        cosine_threshold: float = 0.40,
+        cosine_threshold: float = 0.55,
         require_blink: bool = True,
+        identities_db_path: Optional[str] = None,
+        min_gap: float = 0.05,
     ) -> None:
         logger.info("Initialising AuthPipeline...")
         t0 = time.monotonic()
 
         self._threshold = cosine_threshold
+        self._min_gap = min_gap
 
         # ── Instantiate all pipeline components ───────────────────────────
         self._detector   = FaceDetector(model_path=detector_model)
@@ -124,15 +127,16 @@ class AuthPipeline:
         self._recognizer = FaceRecognizer(
             model_path=recognizer_model,
             cosine_threshold=cosine_threshold,
+            db_path=identities_db_path,
         )
         self._liveness   = LivenessDetector(
         model_dir="models/antispoofing",
         require_blink=require_blink,
         )
 
-        # ── In-memory gallery ─────────────────────────────────────────────
-        # In production, replace with EmbeddingStore (encrypted SQLite).
+        # Gallery mirrors recognizer SQLite-backed enrollments (loaded at startup).
         self._gallery: List[EnrolledIdentity] = []
+        self._sync_gallery_from_recognizer()
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         logger.info(
@@ -167,25 +171,31 @@ class AuthPipeline:
         face_roi = self._processor.crop_face_roi(frame, detection.bbox)
         landmarks = _landmarks_to_dataclass(detection)
         prep = self._processor.preprocess_for_recognition(face_roi, landmarks)
-        emb_result = self._recognizer.get_embedding(prep.tensor)
-
-        self._gallery.append(
-            EnrolledIdentity(
-                label=label,
-                embedding=emb_result.vector,
-                metadata={"is_stub": emb_result.is_stub},
-            )
+        emb_result = self._recognizer.get_embedding(
+            prep.tensor, face_roi_bgr=face_roi
         )
+
+        self._recognizer.enroll(label, emb_result.vector)
+        self._sync_gallery_from_recognizer()
         logger.info(
-            "Enrolled '%s' | embedding_dim=%d is_stub=%s",
-            label, len(emb_result.vector), emb_result.is_stub,
+            "Enrolled '%s' | embedding_dim=%d is_stub=%s gallery_size=%d",
+            label, len(emb_result.vector), emb_result.is_stub, len(self._gallery),
         )
         return True
 
     def load_gallery(self, identities: List[EnrolledIdentity]) -> None:
-        """Bulk-load pre-computed embeddings (e.g. from encrypted SQLite store)."""
-        self._gallery = identities
+        """Bulk-load embeddings into recognizer (SQLite) and in-memory gallery."""
+        self._recognizer.clear_enrollment()
+        for identity in identities:
+            self._recognizer.enroll(identity.label, identity.embedding)
+        self._sync_gallery_from_recognizer()
         logger.info("Gallery loaded with %d identities.", len(self._gallery))
+
+    def _sync_gallery_from_recognizer(self) -> None:
+        self._gallery = [
+            EnrolledIdentity(label=name, embedding=emb.copy())
+            for name, emb in self._recognizer.enrolled_identities().items()
+        ]
 
     # ── Main authentication method ────────────────────────────────────────
 
@@ -280,7 +290,8 @@ class AuthPipeline:
 
         # ── Step 5: Liveness detection ────────────────────────────────────
         liveness_result: LivenessResult = self._liveness.predict_liveness(
-            face_bgr=face_roi,
+            frame_bgr=frame,
+            bbox=detection.bbox,
             face_landmarks=face_landmarks_2d,
         )
 
@@ -308,13 +319,14 @@ class AuthPipeline:
 
         # ── Step 6: Face recognition ──────────────────────────────────────
         emb_result: EmbeddingResult = self._recognizer.get_embedding(
-            recog_prep.tensor
+            recog_prep.tensor, face_roi_bgr=face_roi
         )
 
         # ── Step 7: Gallery match ─────────────────────────────────────────
         match_label, best_similarity = self._find_best_match(emb_result)
 
-        is_match = best_similarity >= self._threshold
+        # match_label is None when _find_best_match rejected due to low score or ambiguity
+        is_match = match_label is not None and best_similarity >= self._threshold
 
         decision = AuthDecision.ALLOW if is_match else AuthDecision.DENY
 
@@ -335,13 +347,10 @@ class AuthPipeline:
         probe: EmbeddingResult,
     ) -> tuple:
         """
-        Linear scan of the gallery for the highest cosine similarity.
-
-        For galleries >1000 identities, replace with FAISS or
-        ball-tree approximate nearest neighbour search.
+        Linear scan with second-best gap check.
 
         Returns (best_label, best_similarity).
-        If gallery is empty returns (None, 0.0).
+        Returns (None, 0.0) if gallery empty or match is ambiguous/weak.
         """
         if not self._gallery:
             logger.warning("Gallery is empty. No match possible.")
@@ -349,17 +358,37 @@ class AuthPipeline:
 
         best_label = None
         best_sim = -1.0
+        second_sim = -1.0
 
         for identity in self._gallery:
             sim = cosine_similarity(probe.vector, identity.embedding)
             if sim > best_sim:
+                second_sim = best_sim          # push old best down
                 best_sim = sim
                 best_label = identity.label
+            elif sim > second_sim:
+                second_sim = sim               # track runner-up
+
+        gap = best_sim - second_sim
 
         logger.debug(
-            "Gallery search: best_match='%s' similarity=%.4f (gallery_size=%d)",
-            best_label, best_sim, len(self._gallery),
+            "Gallery search: best='%s' sim=%.4f second_sim=%.4f gap=%.4f (gallery=%d)",
+            best_label, best_sim, second_sim, gap, len(self._gallery),
         )
+
+        # ── Security gate ──────────────────────────────────────────────────
+        # 1. Score must clear the threshold
+        # 2. Gap must be wide enough to reject ambiguous matches
+        #    (skip gap check when only 1 identity enrolled — no runner-up exists)
+        min_gap = 0.05 if len(self._gallery) > 1 else 0.0
+
+        if best_sim < self._threshold or gap < min_gap:
+            logger.info(
+                "Match REJECTED: sim=%.4f threshold=%.2f gap=%.4f min_gap=%.2f",
+                best_sim, self._threshold, gap, min_gap,
+            )
+            return None, float(best_sim)      # return score for logging, label=None = no match
+
         return best_label, float(best_sim)
 
 
