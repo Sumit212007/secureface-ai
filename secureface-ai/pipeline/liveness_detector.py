@@ -15,11 +15,11 @@ Two-tier liveness system:
         index 2 → replay_attack
     live_probability = softmax(logits)[1]
 
-    CRITICAL — crop contract:
-        predict() takes the FULL camera frame + raw bbox from the detector.
-        Each model does its own Silent-Face square crop (side = max(w,h)*scale,
-        centred on bbox) before inference.  A pre-cropped patch is NOT accepted
-        here; too-tight crops score as SPOOF regardless of the real face.
+    CRITICAL — input contract:
+        predict() takes the FULL camera frame + raw bbox (x1,y1,x2,y2).
+        Silent-Face CropImage expands the bbox by the model scale (2.7 / 4.0),
+        resizes to 80×80, then ToTensor → float32 BGR in [0, 255] (no /255,
+        no ImageNet normalisation).  Wrong value range yields live_prob ≈ 0.01.
 
   Tier 2 (Active): Eye Aspect Ratio (EAR) blink detector
     - Requires MediaPipe Face Mesh landmarks (6-point eye model)
@@ -57,19 +57,20 @@ EAR_BLINK_TIMEOUT_SEC:  float = 6.0   # seconds allowed for blink challenge
 _MINIFAS_INPUT_H: int = 80
 _MINIFAS_INPUT_W: int = 80
 
-# ImageNet normalisation — BGR channel order (matches Silent-Face repo)
-_IMAGENET_MEAN = np.array([0.406, 0.456, 0.485], dtype=np.float32)
-_IMAGENET_STD  = np.array([0.225, 0.224, 0.229], dtype=np.float32)
-
 # MiniFASNet class layout: index 1 is "live"
 _LIVE_CLASS_INDEX: int = 1
 
 # Default model directory
 _DEFAULT_MODEL_DIR: str = "models/antispoofing"
 
+# Set SECUREFACE_LIVENESS_DEBUG=1 to log crop/tensor stats and write crops to debug/
+_LIVENESS_DEBUG: bool = os.environ.get(
+    "SECUREFACE_LIVENESS_DEBUG", ""
+).lower() in ("1", "true", "yes")
+
 # Candidate model files with their Silent-Face crop scale factors.
 # Tried in order; first file found is loaded as the primary model.
-# The scale determines side = max(bbox_w, bbox_h) * scale, centred on bbox.
+# The scale is passed to Silent-Face CropImage (expands bbox width/height).
 _CANDIDATE_MODELS: List[Tuple[str, float]] = [
     ("antispoofing.onnx",            2.7),   # single-model export
     ("2.7_80x80_MiniFASNetV2.onnx",  2.7),
@@ -249,7 +250,7 @@ class AntiSpoofingCNN:
         if self._use_onnx:
             return self._onnx_predict(frame_bgr, bbox)
         else:
-            crop     = _scale_crop(frame_bgr, bbox, 2.7)
+            crop     = _silent_face_crop(frame_bgr, bbox, 2.7)
             prob     = self._lbp_heuristic(crop)
             decision = self._threshold_to_decision(prob)
             return CnnLivenessResult(
@@ -268,7 +269,7 @@ class AntiSpoofingCNN:
         bbox:      Tuple[int, int, int, int],
     ) -> CnnLivenessResult:
         """Crop → preprocess → infer → softmax → return result."""
-        crop = _scale_crop(frame_bgr, bbox, self._scale)
+        crop = _silent_face_crop(frame_bgr, bbox, self._scale)
         if crop.size == 0:
             logger.warning(
                 "_onnx_predict: empty crop for bbox=%s on %dx%d frame.",
@@ -283,9 +284,10 @@ class AntiSpoofingCNN:
             )
 
         tensor = _preprocess_minifas(crop)
+        _debug_liveness_artifacts(frame_bgr, bbox, crop, tensor, self._scale)
         logger.debug(
-            "Anti-spoofing input | tensor shape=%s dtype=%s range=[%.3f, %.3f]",
-            tensor.shape, tensor.dtype, float(tensor.min()), float(tensor.max()),
+            "Anti-spoofing input | crop=%s tensor=%s range=[%.1f, %.1f]",
+            crop.shape, tensor.shape, float(tensor.min()), float(tensor.max()),
         )
 
         t0 = time.perf_counter()
@@ -573,64 +575,135 @@ class LivenessDetector:
 
 # ── Module-level utilities ────────────────────────────────────────────────────
 
-def _scale_crop(
+def _silent_face_crop(
     frame: np.ndarray,
-    bbox:  Tuple[int, int, int, int],
+    bbox_xyxy: Tuple[int, int, int, int],
     scale: float,
 ) -> np.ndarray:
     """
-    Silent-Face correct square crop — matches CropImage in the original repo.
+    Silent-Face ``CropImage.crop`` — rectangular expand + resize to 80×80.
 
-    side = max(bbox_w, bbox_h) * scale
-    The crop is centred on the bbox centre and clamped to frame boundaries.
-
-    Using the longer axis + the model's own scale factor guarantees the
-    surrounding skin/background context the model was trained on is present.
-    A tight rectangular crop (20% padding) reliably produces SPOOF outputs.
+    ``bbox_xyxy`` is converted to ``(x, y, width, height)`` as in the upstream
+    RetinaFace helper.  Edge shifting keeps crop size when possible instead of
+    returning a shrunken non-square patch from hard clamping.
     """
-    x1, y1, x2, y2 = bbox
+    x1, y1, x2, y2 = bbox_xyxy
     bw, bh = x2 - x1, y2 - y1
     if bw <= 0 or bh <= 0:
-        logger.warning("_scale_crop: degenerate bbox %s", bbox)
+        logger.warning("_silent_face_crop: degenerate bbox %s", bbox_xyxy)
         return np.empty((0, 0, 3), dtype=np.uint8)
 
-    cx, cy    = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    half_side = max(bw, bh) * scale / 2.0
-    fh, fw    = frame.shape[:2]
-
-    nx1 = max(0, int(cx - half_side))
-    ny1 = max(0, int(cy - half_side))
-    nx2 = min(fw, int(cx + half_side))
-    ny2 = min(fh, int(cy + half_side))
-
-    crop = frame[ny1:ny2, nx1:nx2]
+    src_h, src_w = frame.shape[:2]
+    left, top, right, bottom = _get_new_box_silent_face(
+        src_w, src_h, (x1, y1, bw, bh), scale,
+    )
+    crop = frame[top: bottom + 1, left: right + 1]
     if crop.size == 0:
         logger.warning(
-            "_scale_crop: empty result bbox=%s scale=%.1f frame=%dx%d",
-            bbox, scale, fw, fh,
+            "_silent_face_crop: empty result bbox=%s scale=%.1f frame=%dx%d",
+            bbox_xyxy, scale, src_w, src_h,
         )
-    return crop
+        return crop
+
+    return cv2.resize(
+        crop,
+        (_MINIFAS_INPUT_W, _MINIFAS_INPUT_H),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+
+def _get_new_box_silent_face(
+    src_w: int,
+    src_h: int,
+    bbox_xywh: Tuple[int, int, int, int],
+    scale: float,
+) -> Tuple[int, int, int, int]:
+    """Port of ``CropImage._get_new_box`` from Silent-Face-Anti-Spoofing."""
+    x, y, box_w, box_h = bbox_xywh
+    scale = min((src_h - 1) / box_h, min((src_w - 1) / box_w, scale))
+
+    new_width  = box_w * scale
+    new_height = box_h * scale
+    center_x   = box_w / 2.0 + x
+    center_y   = box_h / 2.0 + y
+
+    left_top_x     = center_x - new_width / 2
+    left_top_y     = center_y - new_height / 2
+    right_bottom_x = center_x + new_width / 2
+    right_bottom_y = center_y + new_height / 2
+
+    if left_top_x < 0:
+        right_bottom_x -= left_top_x
+        left_top_x = 0
+    if left_top_y < 0:
+        right_bottom_y -= left_top_y
+        left_top_y = 0
+    if right_bottom_x > src_w - 1:
+        left_top_x -= right_bottom_x - src_w + 1
+        right_bottom_x = src_w - 1
+    if right_bottom_y > src_h - 1:
+        left_top_y -= right_bottom_y - src_h + 1
+        right_bottom_y = src_h - 1
+
+    return (
+        int(left_top_x),
+        int(left_top_y),
+        int(right_bottom_x),
+        int(right_bottom_y),
+    )
 
 
 def _preprocess_minifas(face_bgr: np.ndarray) -> np.ndarray:
     """
-    Resize and normalise a BGR face crop for Silent-Face ONNX models.
+    Silent-Face ``ToTensor`` for ONNX MiniFASNet (no ImageNet normalisation).
 
-    Steps
-    -----
-    1. Resize to 80×80 (INTER_LINEAR)
-    2. Cast to float32, divide by 255  →  [0.0, 1.0]
-    3. Subtract ImageNet BGR mean, divide by ImageNet BGR std
-    4. Transpose HWC → CHW
-    5. Add batch dim  →  (1, 3, 80, 80) float32
+    The PyTorch reference uses ``img.astype(float32)`` on uint8 BGR pixels in
+    ``[0, 255]`` — not ``/255`` and not ImageNet mean/std.  Using 0–1 or
+    ImageNet stats drives live_prob to ~0.01 on real faces.
     """
-    img = cv2.resize(face_bgr, (_MINIFAS_INPUT_W, _MINIFAS_INPUT_H),
-                     interpolation=cv2.INTER_LINEAR)
-    img = img.astype(np.float32) / 255.0
-    img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
-    img = img.transpose(2, 0, 1)          # HWC → CHW
-    img = np.expand_dims(img, axis=0)     # → (1, 3, 80, 80)
-    return img.astype(np.float32)
+    if face_bgr.shape[:2] != (_MINIFAS_INPUT_H, _MINIFAS_INPUT_W):
+        face_bgr = cv2.resize(
+            face_bgr,
+            (_MINIFAS_INPUT_W, _MINIFAS_INPUT_H),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    img = face_bgr.astype(np.float32)
+    img = img.transpose(2, 0, 1)
+    return np.expand_dims(img, axis=0).astype(np.float32)
+
+
+def _debug_liveness_artifacts(
+    frame_bgr: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    crop: np.ndarray,
+    tensor: np.ndarray,
+    scale: float,
+) -> None:
+    """Optional diagnostics when SECUREFACE_LIVENESS_DEBUG=1."""
+    if not _LIVENESS_DEBUG:
+        return
+
+    fh, fw = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = bbox
+    logger.info(
+        "Liveness debug | frame=%dx%d bbox_xyxy=%s bbox_frac=%.2fx%.2f "
+        "crop=%s tensor=%s range=[%.1f, %.1f] scale=%.1f",
+        fw, fh, bbox,
+        (x2 - x1) / max(fw, 1), (y2 - y1) / max(fh, 1),
+        crop.shape, tensor.shape,
+        float(tensor.min()), float(tensor.max()), scale,
+    )
+
+    debug_dir = os.path.join("debug", "liveness")
+    os.makedirs(debug_dir, exist_ok=True)
+    stamp = int(time.time() * 1000)
+    crop_path = os.path.join(debug_dir, f"crop_{stamp}.jpg")
+    cv2.imwrite(crop_path, crop)
+
+    vis = frame_bgr.copy()
+    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
+    cv2.imwrite(os.path.join(debug_dir, f"frame_{stamp}.jpg"), vis)
+    logger.info("Liveness debug saved: %s", crop_path)
 
 
 def _compute_ear(
