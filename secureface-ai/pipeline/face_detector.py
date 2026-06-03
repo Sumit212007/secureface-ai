@@ -246,10 +246,13 @@ class FaceDetector:
         """Full BlazeFace TFLite inference path."""
         frame_h, frame_w = frame.shape[:2]
 
-        # ── Preprocess: BGR → RGB, resize, normalise ─────────────────────
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (BLAZEFACE_INPUT_SIZE, BLAZEFACE_INPUT_SIZE),
-                         interpolation=cv2.INTER_LINEAR)
+        # ── Preprocess: BGR → RGB, letterbox to 128², normalise ─────────
+        # MediaPipe keeps aspect ratio with padding; stretch-resize skews boxes
+        # on wide/high-res frames and inflates bboxes when mapped to pixels.
+        img, lb_scale, pad_x, pad_y, _, _ = _letterbox_rgb(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+            BLAZEFACE_INPUT_SIZE,
+        )
         img = img.astype(np.float32) / 127.5 - 1.0   # → [-1, 1]
         img = np.expand_dims(img, axis=0)             # (1, 128, 128, 3)
 
@@ -260,7 +263,13 @@ class FaceDetector:
 
         # ── Decode ───────────────────────────────────────────────────────
         detections = self._decode_predictions(
-            raw_boxes, raw_scores, frame_w, frame_h
+            raw_boxes,
+            raw_scores,
+            frame_w,
+            frame_h,
+            lb_scale,
+            pad_x,
+            pad_y,
         )
 
         return detections
@@ -297,6 +306,9 @@ class FaceDetector:
         raw_scores: np.ndarray,
         frame_w: int,
         frame_h: int,
+        lb_scale: float = 1.0,
+        pad_x: int = 0,
+        pad_y: int = 0,
     ) -> List[FaceDetection]:
         """
         Decode BlazeFace anchor-relative regressions → absolute pixel boxes.
@@ -329,19 +341,21 @@ class FaceDetector:
         w  = boxes[:, 3] / s
         h  = boxes[:, 2] / s
 
-        # Convert to absolute pixel coords in the *original* frame
-        x1 = np.clip(((cx - w / 2) * frame_w).astype(int), 0, frame_w - 1)
-        y1 = np.clip(((cy - h / 2) * frame_h).astype(int), 0, frame_h - 1)
-        x2 = np.clip(((cx + w / 2) * frame_w).astype(int), 0, frame_w - 1)
-        y2 = np.clip(((cy + h / 2) * frame_h).astype(int), 0, frame_h - 1)
+        # Map normalised letterbox coords → original frame pixels
+        x1, y1, x2, y2 = _letterbox_boxes_to_frame(
+            cx, cy, w, h, frame_w, frame_h, lb_scale, pad_x, pad_y,
+        )
 
         # ── Decode landmarks (6 keypoints × 2 coords = 12 values) ────────
         all_landmarks: List[List[Tuple[float, float]]] = []
         for i in range(len(scores)):
             pts = []
             for k in range(6):
-                lm_y = (anchors[i, 1] + boxes[i, 4 + k * 2]     / s) * frame_h
-                lm_x = (anchors[i, 0] + boxes[i, 4 + k * 2 + 1] / s) * frame_w
+                lm_cy = anchors[i, 1] + boxes[i, 4 + k * 2]     / s
+                lm_cx = anchors[i, 0] + boxes[i, 4 + k * 2 + 1] / s
+                lm_x, lm_y = _letterbox_point_to_frame(
+                    lm_cx, lm_cy, lb_scale, pad_x, pad_y,
+                )
                 pts.append((float(lm_x), float(lm_y)))
             all_landmarks.append(pts)
 
@@ -444,3 +458,70 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
         1.0 / (1.0 + np.exp(-x)),
         np.exp(x) / (1.0 + np.exp(x)),
     )
+
+
+def _letterbox_rgb(
+    image_rgb: np.ndarray,
+    target: int,
+) -> Tuple[np.ndarray, float, int, int, int, int]:
+    """
+    Resize with aspect ratio preserved, pad to ``target × target`` (MediaPipe style).
+
+    Returns padded image, scale, pad_x, pad_y, resized_w, resized_h.
+    """
+    h, w = image_rgb.shape[:2]
+    scale = min(target / w, target / h)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    resized = cv2.resize(
+        image_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR,
+    )
+    pad_x = (target - new_w) // 2
+    pad_y = (target - new_h) // 2
+    padded = np.zeros((target, target, 3), dtype=image_rgb.dtype)
+    padded[pad_y: pad_y + new_h, pad_x: pad_x + new_w] = resized
+    return padded, scale, pad_x, pad_y, new_w, new_h
+
+
+def _letterbox_point_to_frame(
+    cx_norm: float,
+    cy_norm: float,
+    scale: float,
+    pad_x: int,
+    pad_y: int,
+    input_size: int = BLAZEFACE_INPUT_SIZE,
+) -> Tuple[float, float]:
+    """Invert letterbox: normalised coords on 128² canvas → original pixels."""
+    px = cx_norm * input_size
+    py = cy_norm * input_size
+    return (px - pad_x) / scale, (py - pad_y) / scale
+
+
+def _letterbox_boxes_to_frame(
+    cx: np.ndarray,
+    cy: np.ndarray,
+    w: np.ndarray,
+    h: np.ndarray,
+    frame_w: int,
+    frame_h: int,
+    scale: float,
+    pad_x: int,
+    pad_y: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorised bbox decode from letterbox-normalised centres/sizes."""
+    s = float(BLAZEFACE_INPUT_SIZE)
+    cx_px = cx * s
+    cy_px = cy * s
+    w_px  = w * s
+    h_px  = h * s
+
+    cx_o = (cx_px - pad_x) / scale
+    cy_o = (cy_px - pad_y) / scale
+    w_o  = w_px / scale
+    h_o  = h_px / scale
+
+    x1 = np.clip((cx_o - w_o / 2).astype(int), 0, frame_w - 1)
+    y1 = np.clip((cy_o - h_o / 2).astype(int), 0, frame_h - 1)
+    x2 = np.clip((cx_o + w_o / 2).astype(int), 0, frame_w - 1)
+    y2 = np.clip((cy_o + h_o / 2).astype(int), 0, frame_h - 1)
+    return x1, y1, x2, y2
