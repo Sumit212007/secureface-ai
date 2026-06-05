@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from pipeline.orchestrator import AuthPipeline
 from database.user_store import UserStore
 import cv2
@@ -6,6 +7,7 @@ import numpy as np
 import uuid
 
 app = Flask(__name__)
+CORS(app)
 
 print("Loading SecureEdge AI...")
 pipeline = AuthPipeline(
